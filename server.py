@@ -16,13 +16,16 @@ from urllib.parse import urlparse
 # Load environment variables from .env file
 load_dotenv()
 
-#litellm._turn_on_debug()
+# Enable LiteLLM debug mode for performance analysis
+litellm.set_verbose = True
+# litellm._turn_on_debug()  # Uncomment for even more verbose output
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 print("OPENAI_API_BASE:",os.environ.get("OPENAI_API_BASE","https://api.openai.com/v1"), flush=True)
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
+    level=logging.DEBUG,  # Change to DEBUG to show detailed timing
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
@@ -170,7 +173,12 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any] = Field(..., description="JSON Schema for tool input")
 
 class ThinkingConfig(BaseModel):
-    enabled: bool = Field(..., description="Enable thinking mode (Anthropic experimental)")
+    enabled: Optional[bool] = Field(None, description="Enable thinking mode (Anthropic experimental)")
+    type: Optional[str] = Field(None, description="Thinking type (e.g., 'enabled')")
+    budget_tokens: Optional[int] = Field(None, description="Budget tokens for thinking")
+    
+    class Config:
+        extra = "allow"  # Allow additional fields from client
 
 class MessagesRequest(BaseModel):
     model: str = Field(..., description="Model id; accepts provider-prefixed (openai/..., anthropic/...) or will be normalized.", examples=["anthropic/claude-3-5-sonnet-20240620", "openai/gpt-4o-mini"])
@@ -464,14 +472,39 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         max_tokens = min(max_tokens, MAX_TOKENS)
         logger.debug(f"Capping max_tokens to {MAX_TOKENS} for OpenAI model (original value: {anthropic_request.max_tokens})")
     
+    # Prepare model name for LiteLLM
+    # When using custom api_base (like LM Studio), preserve the exact model name
+    model_for_litellm = anthropic_request.model
+    openai_api_base = os.environ.get("OPENAI_API_BASE")
+    
+    # If using custom api_base (LM Studio), strip provider prefixes
+    # because LiteLLM will strip them anyway and we want consistent behavior
+    if openai_api_base:
+        if model_for_litellm.startswith("openai/"):
+            model_for_litellm = model_for_litellm[7:]  # Remove "openai/" prefix
+            logger.debug(f"Stripped openai/ prefix for custom endpoint: {model_for_litellm}")
+        elif model_for_litellm.startswith("anthropic/"):
+            model_for_litellm = model_for_litellm[10:]  # Remove "anthropic/" prefix
+            logger.debug(f"Stripped anthropic/ prefix for custom endpoint: {model_for_litellm}")
+        logger.debug(f"Using custom api_base with model: {model_for_litellm}")
+    
     # Create LiteLLM request dict
     litellm_request = {
-        "model": anthropic_request.model,  # t understands "anthropic/claude-x" format
+        "model": model_for_litellm,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": anthropic_request.temperature,
         "stream": anthropic_request.stream,
     }
+    
+    # Add api_base from environment if set (for LM Studio, etc.)
+    openai_api_base = os.environ.get("OPENAI_API_BASE")
+    if openai_api_base:
+        litellm_request["api_base"] = openai_api_base
+        # Use custom_llm_provider to prevent LiteLLM from modifying the model name
+        # This ensures the exact model name is sent to LM Studio
+        litellm_request["custom_llm_provider"] = "openai"
+        logger.debug(f"Using custom endpoint: {openai_api_base} with model: {model_for_litellm}")
     
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -1049,6 +1082,18 @@ async def create_message(
 
         # Build backend auth headers based on provider; prefer passthrough
         incoming_x_api_key = x_api_key or raw_request.headers.get("x-api-key") or raw_request.headers.get("X-API-Key")
+        
+        # Also check Authorization header (Bearer token)
+        if not incoming_x_api_key:
+            auth_header = raw_request.headers.get("authorization") or raw_request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                incoming_x_api_key = auth_header[7:]  # Remove "Bearer " prefix
+        
+        # Fallback to environment variable if no key provided (for LM Studio, etc.)
+        if not incoming_x_api_key and OPENAI_API_KEY:
+            incoming_x_api_key = OPENAI_API_KEY
+            logger.debug("Using OPENAI_API_KEY from environment")
+        
         backend_headers = {}
         
         if incoming_x_api_key:
@@ -1199,8 +1244,14 @@ async def create_message(
                     logger.warning(f"Message {i} has None content - replacing with placeholder")
                     litellm_request["messages"][i]["content"] = "..." # Fallback placeholder
         
-        # Only log basic info about the request, not the full details
-        logger.debug(f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}")
+        # Log request details before sending to LiteLLM
+        total_content_length = sum(len(str(msg.get('content', ''))) for msg in litellm_request.get('messages', []))
+        logger.info(f"🚀 LITELLM REQUEST: model={litellm_request.get('model')}, "
+                   f"api_base={litellm_request.get('api_base', 'default')}, "
+                   f"messages={len(litellm_request.get('messages', []))}, "
+                   f"content_length={total_content_length}, "
+                   f"max_tokens={litellm_request.get('max_tokens')}, "
+                   f"stream={litellm_request.get('stream', False)}")
         
         # Handle streaming mode
         if request.stream:
@@ -1217,6 +1268,7 @@ async def create_message(
                 200  # Assuming success at this point
             )
             # Ensure we use the async version for streaming
+            logger.debug(f"Calling litellm.acompletion with model: {litellm_request.get('model')}")
             response_generator = await litellm.acompletion(**litellm_request)
             
             return StreamingResponse(
@@ -1237,6 +1289,7 @@ async def create_message(
                 200  # Assuming success at this point
             )
             start_time = time.time()
+            logger.debug(f"Calling litellm.completion with model: {litellm_request.get('model')}")
             litellm_response = litellm.completion(**litellm_request)
             logger.debug(f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s")
             
@@ -1267,8 +1320,13 @@ async def create_message(
                 if key not in error_details and key not in ['args', '__traceback__']:
                     error_details[key] = str(value)
         
-        # Log all error details
-        logger.error(f"Error processing request: {json.dumps(error_details, indent=2, ensure_ascii=False)}")
+        # Log all error details (use default=str to handle non-serializable objects)
+        try:
+            logger.error(f"Error processing request: {json.dumps(error_details, indent=2, ensure_ascii=False, default=str)}")
+        except Exception:
+            # Fallback: convert all values to strings
+            safe_error_details = {k: str(v) for k, v in error_details.items()}
+            logger.error(f"Error processing request: {json.dumps(safe_error_details, indent=2, ensure_ascii=False)}")
         
         # Format error for response
         error_message = f"Error: {str(e)}"

@@ -592,6 +592,84 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     
     return litellm_request
 
+def parse_tool_use_from_text(content: str) -> tuple[list, str]:
+    """
+    Parse Local LLM text output to detect Tool Use patterns and convert to Anthropic format.
+    
+    Returns:
+        tuple: (content_blocks, stop_reason)
+            - content_blocks: List of Anthropic content blocks (text and tool_use)
+            - stop_reason: Suggested stop_reason based on detected patterns
+    """
+    import re
+    
+    # Pattern to detect [Tool Use: ToolName] followed by Input: {...}
+    # Supports both single-line and multi-line JSON
+    tool_pattern = r'\[Tool Use:\s*(\w+)\]\s*\nInput:\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
+    
+    matches = list(re.finditer(tool_pattern, content, re.DOTALL | re.MULTILINE))
+    
+    if not matches:
+        # No tool use detected - return as simple text
+        return [{"type": "text", "text": content}], "end_turn"
+    
+    blocks = []
+    last_end = 0
+    
+    for match in matches:
+        # Add text before this tool use
+        if match.start() > last_end:
+            text_before = content[last_end:match.start()].strip()
+            if text_before:
+                blocks.append({
+                    "type": "text",
+                    "text": text_before
+                })
+        
+        # Extract tool information
+        tool_name = match.group(1)
+        tool_input_str = match.group(2)
+        
+        try:
+            tool_input = json.loads(tool_input_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse tool input JSON: {e}")
+            # Fallback: treat as text
+            blocks.append({
+                "type": "text",
+                "text": f"[Tool Use: {tool_name}]\nInput: {tool_input_str}"
+            })
+            last_end = match.end()
+            continue
+        
+        # Create tool_use block
+        tool_id = f"toolu_{uuid.uuid4().hex[:24]}"
+        blocks.append({
+            "type": "tool_use",
+            "id": tool_id,
+            "name": tool_name,
+            "input": tool_input
+        })
+        
+        logger.info(f"✅ Detected Tool Use: {tool_name} (ID: {tool_id})")
+        
+        last_end = match.end()
+    
+    # Add remaining text after last tool use
+    if last_end < len(content):
+        remaining = content[last_end:].strip()
+        if remaining:
+            blocks.append({
+                "type": "text",
+                "text": remaining
+            })
+    
+    # If we found any tool use, set stop_reason to tool_use
+    stop_reason = "tool_use" if any(b.get("type") == "tool_use" for b in blocks) else "end_turn"
+    
+    return blocks, stop_reason
+
+
 def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], 
                                  original_request: MessagesRequest) -> MessagesResponse:
     """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
@@ -646,12 +724,24 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         
         # Create content list for Anthropic format
         content = []
+        detected_stop_reason = finish_reason  # Default to LLM's finish_reason
         
-        # Add text content block if present (text might be None or empty for pure tool call responses)
+        # Parse text content for Tool Use patterns (for Local LLMs)
         if content_text is not None and content_text != "":
-            content.append({"type": "text", "text": content_text})
+            # Try to detect Tool Use patterns in the text
+            parsed_blocks, parsed_stop_reason = parse_tool_use_from_text(content_text)
+            
+            # If we detected tool use patterns, use the parsed content
+            if any(b.get("type") == "tool_use" for b in parsed_blocks):
+                logger.info(f"🔧 Tool Use detected in text output - converting to Anthropic format")
+                content = parsed_blocks
+                detected_stop_reason = parsed_stop_reason
+            else:
+                # No tool use detected - add as simple text block
+                content.append({"type": "text", "text": content_text})
         
         # Add tool calls if present (tool_use in Anthropic format) - only for Claude models
+        # This handles native tool_calls from models that support them
         if tool_calls and is_claude_model:
             logger.debug(f"Processing tool calls: {tool_calls}")
             
@@ -741,8 +831,11 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             completion_tokens = getattr(usage_info, "completion_tokens", 0)
         
         # Map OpenAI finish_reason to Anthropic stop_reason
+        # Use detected_stop_reason if we parsed tool use from text
         stop_reason = None
-        if finish_reason == "stop":
+        if detected_stop_reason == "tool_use":
+            stop_reason = "tool_use"
+        elif finish_reason == "stop" or detected_stop_reason == "end_turn":
             stop_reason = "end_turn"
         elif finish_reason == "length":
             stop_reason = "max_tokens"
@@ -980,8 +1073,26 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                             for i in range(1, last_tool_index + 1):
                                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i}, ensure_ascii=False)}\n\n"
                         
+                        # Check if accumulated text contains Tool Use patterns
+                        detected_tool_use = False
+                        detected_stop_reason = None
+                        if accumulated_text:
+                            parsed_blocks, parsed_stop_reason = parse_tool_use_from_text(accumulated_text)
+                            if parsed_stop_reason == "tool_use":
+                                detected_tool_use = True
+                                detected_stop_reason = "tool_use"
+                                # Send tool use blocks
+                                for idx, block in enumerate(parsed_blocks):
+                                    block_index = idx
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': block}, ensure_ascii=False)}\n\n"
+                                    if block['type'] == 'tool_use':
+                                        # Send complete input as delta
+                                        input_json = json.dumps(block['input'], ensure_ascii=False)
+                                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': input_json}}, ensure_ascii=False)}\n\n"
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index}, ensure_ascii=False)}\n\n"
+                        
                         # If we accumulated text but never sent or closed text block, do it now
-                        if not text_block_closed:
+                        if not text_block_closed and not detected_tool_use:
                             if accumulated_text and not text_sent:
                                 # Send the accumulated text
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}}, ensure_ascii=False)}\n\n"
@@ -990,7 +1101,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         
                         # Map OpenAI finish_reason to Anthropic stop_reason
                         stop_reason = "end_turn"
-                        if finish_reason == "length":
+                        if detected_stop_reason:
+                            stop_reason = detected_stop_reason
+                        elif finish_reason == "length":
                             stop_reason = "max_tokens"
                         elif finish_reason == "tool_calls":
                             stop_reason = "tool_use"

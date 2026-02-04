@@ -1,5 +1,15 @@
 # claude-to-openai proxy
 
+> **📌 このリポジトリについて**  
+> このリポジトリは [claude-code-proxy](https://github.com/1rgs/claude-code-proxy) からのフォークです。
+> 
+> **追加された機能：**
+> - 🔧 汎用利用のための修正・拡張
+> - 📊 トークンカウント機能の追加
+> - 🎯 モデルマッピングの強化（環境変数とプレフィックスベース）
+> - 📝 詳細なOpenAPI/Swagger UIドキュメント
+> - 🔇 ログノイズの削減と整形されたリクエストログ
+
 ## Overview
 FastAPI proxy translating Anthropic-style /v1/messages to OpenAI via LiteLLM. Handles model mapping, content block conversion, streaming (SSE), tools, and token counting with reduced logging noise.
 

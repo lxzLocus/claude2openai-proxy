@@ -1,3 +1,5 @@
+> **📌 このドキュメントについて**  
+> このドキュメントは [claude-code-proxy](https://github.com/1rgs/claude-code-proxy) のフォークリポジトリに関連する技術情報です。
 
 # Claude Code + Local LLM 利用時の現状と問題点
 

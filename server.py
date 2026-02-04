@@ -425,46 +425,66 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 messages.append({"role": "user", "content": text_content.strip()})
             else:
                 # Regular handling for other message types
+                # For assistant messages with tool_use/tool_result, convert to OpenAI tool_calls format
+                # For user messages with non-text content, extract text only for LM Studio compatibility
                 processed_content = []
+                has_tool_use = False
+                has_tool_result = False
+                
                 for block in content:
                     if hasattr(block, "type"):
                         if block.type == "text":
+                            # OpenAI format for text content
                             processed_content.append({"type": "text", "text": block.text})
                         elif block.type == "image":
-                            processed_content.append({"type": "image", "source": block.source})
-                        elif block.type == "tool_use":
-                            # Handle tool use blocks if needed
-                            processed_content.append({
-                                "type": "tool_use",
-                                "id": block.id,
-                                "name": block.name,
-                                "input": block.input
-                            })
-                        elif block.type == "tool_result":
-                            # Handle different formats of tool result content
-                            processed_content_block = {
-                                "type": "tool_result",
-                                "tool_use_id": block.tool_use_id if hasattr(block, "tool_use_id") else ""
-                            }
-                            
-                            # Process the content field properly
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    # If it's a simple string, create a text block for it
-                                    processed_content_block["content"] = [{"type": "text", "text": block.content}]
-                                elif isinstance(block.content, list):
-                                    # If it's already a list of blocks, keep it
-                                    processed_content_block["content"] = block.content
+                            # Convert Anthropic image format to OpenAI image_url format
+                            # Anthropic: {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+                            # OpenAI: {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}
+                            if hasattr(block, "source") and isinstance(block.source, dict):
+                                source = block.source
+                                if source.get("type") == "base64":
+                                    media_type = source.get("media_type", "image/png")
+                                    data = source.get("data", "")
+                                    image_url = f"data:{media_type};base64,{data}"
+                                    processed_content.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": image_url}
+                                    })
+                                elif source.get("type") == "url":
+                                    # Handle URL-based images
+                                    url = source.get("url", "")
+                                    processed_content.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": url}
+                                    })
                                 else:
-                                    # Default fallback
-                                    processed_content_block["content"] = [{"type": "text", "text": str(block.content)}]
+                                    logger.warning(f"Unsupported image source type: {source.get('type')}")
                             else:
-                                # Default empty content
-                                processed_content_block["content"] = [{"type": "text", "text": ""}]
-                                
-                            processed_content.append(processed_content_block)
+                                logger.warning(f"Image block missing source: {block}")
+                        elif block.type == "tool_use":
+                            # LM Studio doesn't support tool_use in content blocks
+                            # Convert to plain text representation
+                            has_tool_use = True
+                            tool_text = f"[Tool Use: {block.name}]\nInput: {json.dumps(block.input, ensure_ascii=False)}"
+                            processed_content.append({"type": "text", "text": tool_text})
+                        elif block.type == "tool_result":
+                            # LM Studio doesn't support tool_result in content blocks
+                            # Convert to plain text representation
+                            has_tool_result = True
+                            result_text = parse_tool_result_content(block.content if hasattr(block, "content") else "")
+                            tool_result_text = f"[Tool Result]\n{result_text}"
+                            processed_content.append({"type": "text", "text": tool_result_text})
                 
-                messages.append({"role": msg.role, "content": processed_content})
+                # If all content blocks are text-only, simplify to string format
+                if len(processed_content) == 1 and processed_content[0].get("type") == "text":
+                    messages.append({"role": msg.role, "content": processed_content[0]["text"]})
+                elif all(block.get("type") == "text" for block in processed_content):
+                    # Multiple text blocks - concatenate them
+                    combined_text = "\n\n".join(block["text"] for block in processed_content)
+                    messages.append({"role": msg.role, "content": combined_text})
+                else:
+                    # Mixed content types (text + image)
+                    messages.append({"role": msg.role, "content": processed_content})
     
     # Cap max_tokens using env-defined MAX_TOKENS for OpenAI models
     max_tokens = anthropic_request.max_tokens

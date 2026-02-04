@@ -1,233 +1,126 @@
-# Anthropic互換プロキシ（LiteLLM + LM Studio）  
-## 500エラー / max_tokens 問題 切り分け・確認手順書  
-（Copilot 作業指示用ドキュメント）
+
+# Claude Code + Local LLM 利用時の現状と問題点
+
+## 概要
+
+Claude Code（以下 cc）を Local LLM（Ollama / vLLM / llama.cpp 等）経由で利用した際、  
+**本来表示されるはずの Tool 承認 UI（yes / no / edit など）が表示されず、  
+ツール実行フローが正常に機能しない問題**が発生している。
+
+本ドキュメントは、現在起きている事象・原因・制約を整理したものである。
 
 ---
 
-## 目的
+## 本来の Claude Code の動作（Anthropic Claude 利用時）
 
-- `/v1/messages`（Anthropic互換）で `max_tokens` を指定すると 500 が出る問題の原因特定
-- **LM Studio / LiteLLM / プロキシ変換層** のどこが壊れているかを切り分ける
-- Copilot に「何を確認・修正させるか」を明確化する
+1. LLM が Plan Mode で作業計画を出力する
+2. LLM が `ExitPlanMode` を呼び出す
+3. cc が `allowedPrompts` を解釈する
+4. ユーザーに **yes / no / edit** などの選択肢を UI として表示する
+5. ユーザーが yes を選択すると、対応する Tool（例: Bash）が実行される
 
----
-
-## 全体構成（想定アーキテクチャ）
-
-```
-Client
-  → Anthropic互換 API (/v1/messages)
-    → FastAPI Proxy
-      → LiteLLM
-        → LM Studio (OpenAI互換)
-```
+この一連の流れは、Anthropic Claude SDK が返す  
+**構造化された tool_call / stop_reason イベント**を前提としている。
 
 ---
 
-## 結論サマリ（重要）
+## 現在起きている事象（Local LLM 利用時）
 
-- `max_tokens` は **正しい入力**
-- 500 の直接原因は **プロキシ側の例外処理バグ**
-- `json.dumps()` に **litellm.Response / starlette.Response** を渡して落ちている
-- LiteLLM → LM Studio 呼び出し自体は **成功している可能性が高い**
+- LLM の出力ログ上では以下が確認できる
+  - `[Tool Use: Write]`
+  - `[Tool Use: ExitPlanMode]`
+- しかし、以下が発生しない
+  - Tool 承認 UI（yes / no / edit）の表示
+  - ユーザー選択による Tool 実行
 
----
+結果として、
 
-## 1. LM Studio 単体の健全性確認（最優先）
-
-### 確認内容
-- LM Studio が OpenAI互換 API として正常動作しているか
-
-### 実行コマンド
-```bash
-curl http://localhost:1234/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kimi-k2.5",
-    "messages": [
-      { "role": "user", "content": "こんにちは" }
-    ],
-    "max_tokens": 128
-  }'
-```
-
-### OK条件
-- HTTP 200
-- `choices[0].message.content` が存在
-
-### NGなら
-- LM Studio 側のモデル / API 設定を修正
-- この時点でプロキシは無関係
+- Tool Use が「ログとして表示されるだけ」
+- cc 側の状態遷移（Plan → 承認 → 実行）が行われない
+- ユーザーは次に何を選択すべきか分からない状態になる
 
 ---
 
-## 2. LiteLLM 単体の健全性確認（変換なし）
+## 原因
 
-### 確認内容
-- LiteLLM → LM Studio が問題なく動作するか
+### 1. Claude Code は「テキスト」ではなく「SDKイベント」で Tool を判定している
 
-### 実行コマンド
-```bash
-curl http://<proxy-host>:<port>/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kimi-k2.5",
-    "messages": [
-      { "role": "user", "content": "こんにちは" }
-    ],
-    "max_tokens": 128
-  }'
-```
+Claude Code は以下を前提に実装されている。
 
-### OK条件
-- HTTP 200
-- OpenAI互換レスポンスが返る
+- Anthropic SDK が返す
+  - `tool_call` オブジェクト
+  - `stop_reason`（例: `tool_use`, `end_plan`）
+  - tool 名・引数の構造化データ
+- これらを **内部イベントとして受信**し、UI や実行フローを制御する
 
-### NGなら
-- LiteLLM provider 設定（base_url / api_key / model名）を修正
+Local LLM はこれらの SDK 内部イベントを再現できず、  
+**Tool Use を JSON 風テキストとして出力することしかできない**。
 
 ---
 
-## 3. Anthropic互換 `/v1/messages` の入力仕様確認
+### 2. Local LLM の Tool 出力は cc から見ると「ただの文字列」
 
-### 推奨リクエスト（安全側）
+Local LLM が出力する以下のような内容は：
 
-```json
-{
-  "model": "kimi-k2.5",
-  "max_tokens": 128,
-  "messages": [
-    {
-      "role": "user",
-      "content": [
-        { "type": "text", "text": "こんにちは。自己紹介してください。" }
-      ]
-    }
-  ]
-}
-```
+- `[Tool Use: ExitPlanMode]`
+- `allowedPrompts` を含む JSON 風構造
 
-### 確認ポイント
-- `max_tokens` が **int**
-- `messages[].content` が
-  - string か
-  - `{ type: "text", text: "..." }` 配列
-- `system` は messages に混ぜていない
+であっても、
+
+- cc から見ると「意味を持たない文字列」
+- 承認 UI を起動するトリガにならない
+
+そのため、
+
+- Tool Use ログは表示される
+- しかし Tool 承認フローは開始されない
+
+という中途半端な状態になる。
 
 ---
 
-## 4. create_message() 内の例外処理確認（最重要）
+## system instruction では解決できない理由
 
-### 問題箇所（典型）
+- system instruction は **LLM のテキスト出力の形**しか制御できない
+- Claude Code が必要とする以下の要素は制御不能
+  - `stop_reason`
+  - `tool_call` イベント
+  - `ExitPlanMode` による内部状態遷移
+  - Tool 承認 UI の起動
 
-```python
-logger.error(
-  json.dumps(error_details, indent=2, ensure_ascii=False)
-)
-```
+つまり、
 
-### NG理由
-- `error_details` に以下が含まれる可能性：
-  - `litellm.Response`
-  - `starlette.responses.Response`
-- → JSONシリアライズ不可 → **例外処理中に例外**
+> system instruction でどれだけ Claude 互換の出力をさせても、  
+> cc の Tool 承認 UI を復活させることはできない。
 
 ---
 
-## 5. 応急修正（必須）
+## 現在の制約まとめ
 
-### 修正指示（Copilot向け）
+- Claude Code + Local LLM では以下が利用不可
+  - Plan Mode 承認フロー
+  - yes / no / edit の UI 表示
+  - Tool 実行の自動トリガ
 
-#### 最低限の修正
-```python
-json.dumps(error_details, ensure_ascii=False, default=str)
-```
-
-#### または安全変換
-```python
-safe_error_details = {
-    k: str(v) for k, v in error_details.items()
-}
-logger.error(json.dumps(safe_error_details, ensure_ascii=False))
-```
+- これは設定ミスではなく、**設計上の非互換**である。
 
 ---
 
-## 6. LiteLLM Response の扱い確認
+## 現実的な運用方針（暫定）
 
-### 確認事項
-- LiteLLM の戻り値の型をログ出力
-
-```python
-logger.debug(type(response))
-logger.debug(str(response))
-```
-
-### 対応方針
-- `Response` オブジェクトは
-  - `dict(response)`
-  - `response.model_dump()`
-  - `str(response)`
-  のいずれかに変換してから扱う
+- Claude Code の Tool 承認機構には依存しない
+- 以下を前提とした運用に切り替える
+  - Tool Use / ExitPlanMode を出力させない
+  - yes / no は通常テキストで確認する
+  - 実行コマンドは明示的なテキストブロックとして出力する
+  - 実行はユーザーまたは外部ラッパーが行う
 
 ---
 
-## 7. Anthropic → OpenAI 変換ロジックの確認点
+## 結論
 
-### よく壊れるポイント
-- `max_tokens` + prompt_tokens > context_length
-- `choices[0].message.content` が null
-- streaming=false なのに stream 処理に入る
-- tool / function 呼び出し未対応
+Claude Code は Anthropic Claude 専用に設計されており、  
+Local LLM で完全互換動作をさせることはできない。
 
-### 確認指示
-- except に入る条件をすべて列挙
-- 例外を **raise せず握りつぶしていないか** 確認
-
----
-
-## 8. デバッグ用フラグ
-
-### LiteLLM
-```python
-litellm._turn_on_debug()
-```
-
-### FastAPI
-- request body をそのまま dump（Responseは除外）
-
----
-
-## 9. 最終判定フローチャート
-
-```
-LM Studio OK?
-  ├─ NO → LM Studio 修正
-  └─ YES
-      ↓
-LiteLLM /v1/chat/completions OK?
-  ├─ NO → LiteLLM 設定修正
-  └─ YES
-      ↓
-/v1/messages + max_tokens で例外？
-  ├─ YES → プロキシ変換 / 例外処理バグ
-  └─ NO → 解決
-```
-
----
-
-## 10. Copilot への最終指示（そのまま貼れる）
-
-- `json.dumps()` に渡しているオブジェクトを全洗い出し
-- `Response` 型を **絶対に dumps しない**
-- LiteLLM response を dict / str に変換
-- `/v1/chat/completions` と `/v1/messages` の差分をコメント化
-
----
-
-## 補足
-
-この問題は **max_tokens が原因ではない**。  
-「正しい入力で壊れるコード」を直すのが目的。
-
----
+現在発生している問題は不具合ではなく、  
+**SDK レイヤの非互換による仕様上の制約**である。
